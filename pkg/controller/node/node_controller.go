@@ -178,6 +178,10 @@ func (n *NodeController) generateAnnotation(nodeEgressIPConfigs []*cloudprovider
 	return string(serialized), nil
 }
 
+func (n *NodeController) InitialSync() error {
+	return nil
+}
+
 // TaintKeyExists checks if the given taint key exists in list of taints. Returns true if exists false otherwise.
 // Copied from k8s.io/kubernetes/pkg/util/taints/taints.go to avoid dependency hell.
 func taintKeyExists(taints []v1.Taint, taintKeyToMatch string) bool {

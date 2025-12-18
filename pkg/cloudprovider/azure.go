@@ -9,23 +9,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
-	"k8s.io/utils/ptr"
-
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	azureapi "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/msi-dataplane/pkg/dataplane"
 	configv1 "github.com/openshift/api/config/v1"
+	cloudnetworklisters "github.com/openshift/client-go/cloudnetwork/listers/cloudnetwork/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
+	"github.com/openshift/cloud-network-config-controller/pkg/cloudprivateipconfig"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const (
@@ -698,4 +702,77 @@ func ParseCloudEnvironment(env azureapi.Environment) cloud.Configuration {
 		}
 	}
 	return cloudConfig
+}
+
+// The consensus is to not add egress IP to public load balancer
+// backend pool regardless of the presence of an OutBoundRule.
+// During upgrade this function removes any egress IP added to
+// public load balancer backend pool previously.
+func (a *Azure) SyncLBBackend(cloudPrivateIPConfigLister cloudnetworklisters.CloudPrivateIPConfigLister, nodeLister corelisters.NodeLister) error {
+	cloudPrivateIPConfigs, err := cloudPrivateIPConfigLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("error listing cloud private ip config, err: %v", err)
+	}
+	for _, cloudPrivateIPConfig := range cloudPrivateIPConfigs {
+		ip, _, err := cloudprivateipconfig.NameToIP(cloudPrivateIPConfig.Name)
+		if err != nil {
+			return fmt.Errorf("error parsing CloudPrivateIPConfig %s: %v", cloudPrivateIPConfig.Name, err)
+		}
+		ipc := ip.String()
+		node, err := nodeLister.Get(cloudPrivateIPConfig.Spec.Node)
+		if err != nil && apierrors.IsNotFound(err) {
+			klog.Warningf("source node: %s no longer exists for CloudPrivateIPConfig: %q",
+				cloudPrivateIPConfig.Spec.Node, cloudPrivateIPConfig.Name)
+			continue
+		} else if err != nil {
+			return fmt.Errorf("error getting node %s for CloudPrivateIPConfig %q: %w",
+				cloudPrivateIPConfig.Spec.Node, cloudPrivateIPConfig.Name, err)
+		}
+
+		klog.Infof("Acquiring node lock for modifying load balancer backend pool, node: %s, ip: %s", node.Name, ipc)
+		nodeLock := a.getNodeLock(node.Name)
+		if err := func() error {
+			nodeLock.Lock()
+			defer nodeLock.Unlock()
+			instance, err := a.getInstance(node)
+			if err != nil {
+				return fmt.Errorf("error while retrieving instance details from Azure: %w", err)
+			}
+			networkInterfaces, err := a.getNetworkInterfaces(instance)
+			if err != nil {
+				return fmt.Errorf("error while retrieving interface details from Azure: %w", err)
+			}
+			if networkInterfaces[0].Properties == nil {
+				return fmt.Errorf("nil network interface properties")
+			}
+			// Perform the operation against the first interface listed, which will be
+			// the primary interface (if it's defined as such) or the first one returned
+			// following the order Azure specifies.
+			networkInterface := networkInterfaces[0]
+			var loadBalancerBackendPoolModified bool
+			// omit Egress IP from LB backend pool
+			ipConfigurations := networkInterface.Properties.IPConfigurations
+			for _, ipCfg := range ipConfigurations {
+				if ptr.Deref(ipCfg.Properties.PrivateIPAddress, "") == ipc &&
+					ipCfg.Properties.LoadBalancerBackendAddressPools != nil {
+					ipCfg.Properties.LoadBalancerBackendAddressPools = nil
+					loadBalancerBackendPoolModified = true
+				}
+			}
+			if loadBalancerBackendPoolModified {
+				networkInterface.Properties.IPConfigurations = ipConfigurations
+				poller, err := a.createOrUpdate(networkInterface)
+				if err != nil {
+					return fmt.Errorf("error while updating network interface: %w", err)
+				}
+				if err = a.waitForCompletion(poller); err != nil {
+					return fmt.Errorf("error while updating network interface: %w", err)
+				}
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
